@@ -17,18 +17,18 @@ def size_str(size):
         return '{:.2f} MB'.format(size/1_000_000)
     if size >= 1_000:
         return '{:.2f} KB'.format(size/1_000)
-    return '{} B'.format(size)
+    return '{}  B'.format(size)
 
 def progressbar(progress, bar_length):
     completed_length = int(bar_length*progress)
-    return '[{}{}]'.format('#' * completed_length, ' ' * (bar_length - completed_length))
+    return '[{}{}]'.format('#' * completed_length, '-' * (bar_length - completed_length))
 
 def get_wide_char_num(string):
-    # zh: \u4e00-\u9fa5
-    # jp: \u0800-\u4e00
-    # ko: \uac00-\ud7ff
-    l = re.findall('[\u4e00-\u9fa5, \u0800-\u4e00, \uac00-\ud7ff]', string)
+    l = re.findall('[\u4e00-\u9fa5,\u0800-\u4e00,\uac00-\ud7ff]', string)
     return len(l)
+
+def is_wide_char(c):
+    return '\u0800'<c<'\u9fa5' or '\uac00'<c<'\ud7ff'
 
 def cut_v_str(string, length):
     wide_char_num = get_wide_char_num(string)
@@ -36,15 +36,19 @@ def cut_v_str(string, length):
     if v_len > length:
         l = 0
         for i, c in enumerate(string):
-            l += 2 if '\u0800'<c<'\u9fa5' or '\uac00'<c<'\ud7ff' else 1
+            l += 2 if is_wide_char(c) else 1
             if l > length:
                 string = string[:i]
-    return string
+                if is_wide_char(c) and l - length == 1:
+                    string += ' '
+                    v_len += 1
+                break;
+    return string, v_len
 
 def v_str(string, length, align='<'):
     assert align in ['<', '>', '^']
-    string = cut_v_str(string, length)
-    extra = length - (len(string) + get_wide_char_num(string))
+    string, v_len = cut_v_str(string, length)
+    extra = length - v_len if length >= v_len else 0
     if align == '<':
         return string + ' ' * extra
     elif align == '>':
@@ -84,6 +88,12 @@ class Aria2Rpc():
     def addUri(self, url):
         argList = [[url], {}]
         jsonrpc = self.get_jsonrpc('addUri', argList)
+        return self.aria2_request(jsonrpc)['result']
+
+    def addTorrent(self, torrent: bytes):
+        import base64
+        argList = [base64.b64encode(torrent), [], {}]
+        jsonrpc = self.get_jsonrpc('addTorrent', argList)
         return self.aria2_request(jsonrpc)['result']
 
     def tellActive(self):
@@ -145,12 +155,20 @@ def convert_item(item):
             'status': item['status']
         }
 
+status_symbol = {
+    'active': '>',
+    'complete': 'O',
+    'paused': '|',
+    'error': 'X'
+}
+
 def item_default_format(item):
     item = convert_item(item)
     procentage = '{:.2f} %'.format(item['progress'] * 100)
     bar = progressbar(item['progress'], 10)
     title = v_str(item['title'], 40)
-    return f"{title}  {item['size']:>10}  {item['fileNum']}files  {item['speed']:>11} {bar} {procentage:>8}"
+    status = status_symbol[item['status']]
+    return f"{title}  {item['size']:>10}  {item['fileNum']}  [{status}] {item['speed']:>11} {bar} {procentage:>8}"
 
 def item_detail_format(item):
     item = convert_item(item)
@@ -158,6 +176,8 @@ def item_detail_format(item):
     bar = progressbar(item['progress'], 10)
     title = v_str(item['title'], 40)
     return f"{item['gid']}  {title}  {item['size']:>10}  {item['fileNum']}files  {item['speed']:>11} {bar} {procentage:>8} {item['status']}"
+
+item_default_format_header = 'Name                                            Size  F  Status   Speeds              Progress'
 
 def item_info_format(item):
     bittorrent = item['bittorrent']
@@ -188,18 +208,28 @@ class ListCommand():
 
     def all(self, format='default'):
         'list all task'
+        print(item_default_format_header)
         self.active()
+        self.waiting()
         self.stopped()
 
     def active(self):
         'list active task'
         items_show = '\n'.join([self.item_format(i) for i in aria2rpc.tellActive()])
-        print(items_show)
+        if items_show:
+            print(items_show)
+
+    def waiting(self):
+        'list waiting task'
+        items_show = '\n'.join([self.item_format(i) for i in aria2rpc.tellWaiting()])
+        if items_show:
+            print(items_show)
 
     def stopped(self):
         'list stopped task'
         items_show = '\n'.join([self.item_format(i) for i in aria2rpc.tellStopped()])
-        print(items_show)
+        if items_show:
+            print(items_show)
 
     def __call__(self):
         self.all()
@@ -214,6 +244,19 @@ class Command():
         for url in urls:
             aria2rpc.addUri(url)
             print(f'INFO: new task for {url}')
+
+    def bt(self, *torrent_paths):
+        'new task for torrent files'
+        import os
+        for torrent_path in torrent_paths:
+            torrent_realpath = os.path.realpath(torrent_path)
+            if not os.path.isfile(torrent_realpath):
+                print(f'ERROR: {torrent_path} is not exist')
+                continue
+            with open(torrent_realpath, 'rb') as f:
+                torrent = f.read()
+            aria2rpc.addTorrent(torrent)
+            print(f'INFO: new task for {torrent_path}')
 
     def purge(self):
         'purge download result'
